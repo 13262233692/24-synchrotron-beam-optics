@@ -27,6 +27,283 @@ R_ELECTRON_CM = 2.8179403227e-5
 
 DBL_MIN_NORMAL = 2.2250738585072014e-308
 
+SI_THERMAL_K_W_PER_MK = 156.0
+SI_THERMAL_ALPHA_PER_K = 2.62e-6
+SI_THERMAL_CP_J_PER_KGK = 702.0
+SI_THERMAL_RHO_KG_PER_M3 = 2329.0
+SI_YOUNGS_MODULUS_PA = 1.3011e11
+SI_POISSON_RATIO = 0.279
+
+@dataclass
+class ThermalMaterialProps:
+    k_w_per_mk: float = SI_THERMAL_K_W_PER_MK
+    alpha_per_k: float = SI_THERMAL_ALPHA_PER_K
+    cp_j_per_kgk: float = SI_THERMAL_CP_J_PER_KGK
+    rho_kg_per_m3: float = SI_THERMAL_RHO_KG_PER_M3
+    youngs_modulus_pa: float = SI_YOUNGS_MODULUS_PA
+    poisson_ratio: float = SI_POISSON_RATIO
+
+@dataclass
+class ThermalConfig:
+    crystal_width_mm: float = 50.0
+    crystal_height_mm: float = 50.0
+    crystal_thickness_mm: float = 1.0
+    grid_nx: int = 64
+    grid_ny: int = 64
+    beam_sigma_mm: float = 0.5
+    beam_power_w: float = 500.0
+    heat_sink_temp_k: float = 298.0
+    ambient_temp_k: float = 298.0
+    dt_sec: float = 0.0
+    max_iterations: int = 20000
+    convergence_tolerance_k: float = 1e-3
+    enabled: bool = True
+    dcm_offset_mm: float = 15.0
+
+@dataclass
+class ThermalDeformation:
+    surface_displacement_um: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    surface_slope_rad: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    max_displacement_um: float = 0.0
+    max_slope_rad: float = 0.0
+    mean_slope_rad: float = 0.0
+
+@dataclass
+class PZTCompensation:
+    pitch_bias_rad: float = 0.0
+    pitch_bias_deg: float = 0.0
+    pitch_bias_urad: float = 0.0
+    estimated_beam_height_error_um: float = 0.0
+    compensated_height_error_um: float = 0.0
+    active: bool = True
+
+@dataclass
+class ThermalState:
+    temperature_k: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    deformation: ThermalDeformation = field(default_factory=ThermalDeformation)
+    compensation: PZTCompensation = field(default_factory=PZTCompensation)
+    max_temp_k: float = 0.0
+    min_temp_k: float = 0.0
+    avg_temp_k: float = 0.0
+    delta_t_max_k: float = 0.0
+    converged: bool = False
+    iterations: int = 0
+
+class ThermalFDMSolver:
+    def __init__(self, config: Optional[ThermalConfig] = None,
+                 props: Optional[ThermalMaterialProps] = None):
+        self.cfg = config or ThermalConfig()
+        self.props = props or ThermalMaterialProps()
+        self.nx = self.cfg.grid_nx
+        self.ny = self.cfg.grid_ny
+        self.dx = self.cfg.crystal_width_mm / (self.nx - 1)
+        self.dy = self.cfg.crystal_height_mm / (self.ny - 1)
+        self.cx_idx = self.nx // 2
+        self.cy_idx = self.ny // 2
+        self.beam_x_mm = 0.0
+        self.beam_y_mm = 0.0
+        self.bragg_angle_rad = 0.0
+        n = self.nx * self.ny
+        self.T = np.full(n, self.cfg.ambient_temp_k, dtype=np.float64)
+        self.T_prev = np.full(n, self.cfg.ambient_temp_k, dtype=np.float64)
+        self.Q = self._build_heat_source()
+
+    def _build_heat_source(self) -> np.ndarray:
+        sigma = self.cfg.beam_sigma_mm
+        if sigma <= 0.0 or self.cfg.beam_power_w <= 0.0:
+            return np.zeros(self.nx * self.ny, dtype=np.float64)
+        two_sigma2 = 2.0 * sigma * sigma
+        yy, xx = np.mgrid[0:self.ny, 0:self.nx].astype(np.float64)
+        x_mm = (xx - self.cx_idx) * self.dx - self.beam_x_mm
+        y_mm = (yy - self.cy_idx) * self.dy - self.beam_y_mm
+        r2 = x_mm * x_mm + y_mm * y_mm
+        gaussian = np.exp(-r2 / two_sigma2)
+        dA_mm2 = self.dx * self.dy
+        thickness_mm = self.cfg.crystal_thickness_mm
+        total_integral = float(np.sum(gaussian)) * dA_mm2
+        if total_integral <= 0.0:
+            return np.zeros(self.nx * self.ny, dtype=np.float64)
+        rho_kg_mm3 = self.props.rho_kg_per_m3 * 1e-9
+        cp_j_kgk = self.props.cp_j_per_kgk
+        denom = rho_kg_mm3 * cp_j_kgk * thickness_mm
+        if denom <= 0.0:
+            return np.zeros(self.nx * self.ny, dtype=np.float64)
+        power_density_w_per_mm2 = self.cfg.beam_power_w * gaussian / total_integral
+        Q = power_density_w_per_mm2 / denom
+        _flush_subnormal_array(Q)
+        return Q.ravel()
+
+    def _max_stable_dt(self) -> float:
+        alpha = self.thermal_diffusivity_mm2_per_s()
+        dx2 = self.dx * self.dx
+        dy2 = self.dy * self.dy
+        if alpha <= 0.0 or dx2 <= 0.0 or dy2 <= 0.0:
+            return 1e-3
+        r = 1.0 / dx2 + 1.0 / dy2
+        if r <= 0.0:
+            return 1e-3
+        dt_max = 0.4 / (alpha * r)
+        return max(dt_max, 1e-8)
+
+    def set_beam_position(self, x_mm: float, y_mm: float):
+        self.beam_x_mm = x_mm
+        self.beam_y_mm = y_mm
+        self.Q = self._build_heat_source()
+
+    def set_beam_power(self, power_w: float):
+        self.cfg.beam_power_w = power_w
+        self.Q = self._build_heat_source()
+
+    def set_bragg_angle(self, bragg_rad: float):
+        self.bragg_angle_rad = bragg_rad
+
+    def thermal_diffusivity_mm2_per_s(self) -> float:
+        alpha_m2_per_s = self.props.k_w_per_mk / (self.props.rho_kg_per_m3 * self.props.cp_j_per_kgk)
+        return alpha_m2_per_s * 1e6
+
+    def _apply_boundary_conditions(self, T: np.ndarray):
+        T_sink = self.cfg.heat_sink_temp_k
+        for i in range(self.nx):
+            T[i] = T_sink
+            T[(self.ny - 1) * self.nx + i] = T_sink
+        for j in range(self.ny):
+            T[j * self.nx] = T_sink
+            T[j * self.nx + self.nx - 1] = T_sink
+
+    def _step_explicit(self, dt: float) -> float:
+        saved_mxcsr = _enable_ftz()
+        try:
+            alpha = self.thermal_diffusivity_mm2_per_s()
+            dx2 = self.dx * self.dx
+            dy2 = self.dy * self.dy
+            self.T_prev[:] = self.T
+            Tp = self.T_prev.reshape(self.ny, self.nx)
+            Q2d = self.Q.reshape(self.ny, self.nx)
+            lap_x = (Tp[:, 2:] - 2.0 * Tp[:, 1:-1] + Tp[:, :-2]) / dx2
+            lap_y = (Tp[2:, :] - 2.0 * Tp[1:-1, :] + Tp[:-2, :]) / dy2
+            update = dt * (alpha * (lap_x[1:-1, :] + lap_y[:, 1:-1]) + Q2d[1:-1, 1:-1])
+            _flush_subnormal_array(update)
+            inner_new = Tp[1:-1, 1:-1] + update
+            delta = float(np.max(np.abs(update))) if update.size > 0 else 0.0
+            self.T.reshape(self.ny, self.nx)[1:-1, 1:-1] = inner_new
+            self._apply_boundary_conditions(self.T)
+            return delta
+        finally:
+            _restore_fp_state(saved_mxcsr)
+
+    def solve_steady_state(self) -> ThermalState:
+        saved_mxcsr = _enable_ftz()
+        try:
+            self.Q = self._build_heat_source()
+            self.T[:] = self.cfg.ambient_temp_k
+            self.T_prev[:] = self.cfg.ambient_temp_k
+            self._apply_boundary_conditions(self.T)
+            tol = self.cfg.convergence_tolerance_k
+            max_iter = max(self.cfg.max_iterations, 50000)
+            dt_opt = min(self._max_stable_dt(), self.cfg.dt_sec) if self.cfg.dt_sec > 0 else self._max_stable_dt()
+            iter_count = 0
+            delta = 1e9
+            stationary_count = 0
+            prev_max = self.cfg.ambient_temp_k
+            while iter_count < max_iter and delta > tol:
+                delta = self._step_explicit(dt_opt)
+                iter_count += 1
+                cur_max = float(np.max(self.T))
+                if iter_count > 100 and abs(cur_max - prev_max) < tol * 0.1:
+                    stationary_count += 1
+                    if stationary_count > 500:
+                        break
+                else:
+                    stationary_count = 0
+                prev_max = cur_max
+            state = ThermalState()
+            state.temperature_k = self.T.copy()
+            state.converged = (delta <= tol) or (stationary_count > 500)
+            state.iterations = iter_count
+            state.max_temp_k = float(np.max(self.T))
+            state.min_temp_k = float(np.min(self.T))
+            state.avg_temp_k = float(np.mean(self.T))
+            state.delta_t_max_k = state.max_temp_k - self.cfg.heat_sink_temp_k
+            state.deformation = self.compute_deformation(self.T)
+            state.compensation = self.compute_pzt_compensation(
+                state.deformation, self.cfg.dcm_offset_mm, self.bragg_angle_rad
+            )
+            return state
+        finally:
+            _restore_fp_state(saved_mxcsr)
+
+    def compute_deformation(self, temperature_k: np.ndarray) -> ThermalDeformation:
+        saved_mxcsr = _enable_ftz()
+        try:
+            T = temperature_k.reshape(self.ny, self.nx)
+            surface_row = self.ny - 2
+            bottom_row = 1
+            T_surf = T[surface_row, :]
+            T_bot = T[bottom_row, :]
+            dT = T_surf - T_bot
+            alpha = self.props.alpha_per_k
+            thickness_m = self.cfg.crystal_thickness_mm * 1e-3
+            curvature = alpha * dT / thickness_m
+            x_m = (np.arange(self.nx) - self.cx_idx) * self.dx * 1e-3
+            disp_m = 0.5 * curvature * x_m * x_m
+            T_avg = np.mean(T[1:self.ny-1, :], axis=0) - self.cfg.ambient_temp_k
+            disp_m += alpha * T_avg * self.cfg.crystal_thickness_mm * 1e-3
+            disp_um = disp_m * 1e6
+            _flush_subnormal_array(disp_um)
+            slope = np.zeros(self.nx, dtype=np.float64)
+            slope[1:-1] = (disp_um[2:] - disp_um[:-2]) / (2.0 * self.dx * 1e3)
+            _flush_subnormal_array(slope)
+            defo = ThermalDeformation()
+            defo.surface_displacement_um = disp_um
+            defo.surface_slope_rad = slope
+            defo.max_displacement_um = float(np.max(np.abs(disp_um)))
+            defo.max_slope_rad = float(np.max(np.abs(slope)))
+            defo.mean_slope_rad = float(np.mean(slope[1:-1])) if self.nx > 2 else 0.0
+            return defo
+        finally:
+            _restore_fp_state(saved_mxcsr)
+
+    def compute_pzt_compensation(self, defo: ThermalDeformation,
+                                  offset_mm: float,
+                                  bragg_angle_rad: float) -> PZTCompensation:
+        saved_mxcsr = _enable_ftz()
+        try:
+            pzt = PZTCompensation()
+            pzt.active = True
+            sigma = max(self.cfg.beam_sigma_mm, self.dx)
+            two_sigma2 = 2.0 * sigma * sigma
+            weights = np.zeros(self.nx, dtype=np.float64)
+            total_w = 0.0
+            weighted_slope = 0.0
+            for i in range(1, self.nx - 1):
+                x_mm = (i - self.cx_idx) * self.dx - self.beam_x_mm
+                w = math.exp(-x_mm * x_mm / two_sigma2)
+                weights[i] = w
+                total_w += w
+                weighted_slope += w * defo.surface_slope_rad[i]
+            if total_w > 1e-15:
+                beam_center_slope = weighted_slope / total_w
+            else:
+                beam_center_slope = 0.0
+            if 1 <= self.cx_idx < self.nx - 1 and abs(beam_center_slope) < 1e-15:
+                beam_center_slope = float(defo.surface_slope_rad[self.cx_idx])
+            c1_slope = beam_center_slope
+            cos_theta = math.cos(bragg_angle_rad)
+            if abs(cos_theta) < 1e-9:
+                cos_theta = 1e-9
+            c2_pitch_bias = -c1_slope / cos_theta
+            pzt.pitch_bias_rad = c2_pitch_bias
+            pzt.pitch_bias_deg = c2_pitch_bias * RAD_TO_DEG
+            pzt.pitch_bias_urad = c2_pitch_bias * 1e6
+            L_mm = offset_mm
+            uncomp_err = L_mm * 1e3 * math.tan(2.0 * c1_slope)
+            comp_err = L_mm * 1e3 * math.tan(2.0 * c1_slope + 2.0 * c2_pitch_bias)
+            pzt.estimated_beam_height_error_um = uncomp_err
+            pzt.compensated_height_error_um = _flush_subnormal(abs(comp_err))
+            return pzt
+        finally:
+            _restore_fp_state(saved_mxcsr)
+
 
 def _is_subnormal(x: float) -> bool:
     if x == 0.0:
@@ -335,7 +612,31 @@ class PhotonTransportResult:
     reflectivity_crystal1: float = 0.0
     reflectivity_crystal2: float = 0.0
     transmission_fraction: float = 0.0
+    pzt_pitch_bias_rad: float = 0.0
+    pzt_pitch_bias_urad: float = 0.0
+    beam_height_error_um: float = 0.0
+    compensated_height_error_um: float = 0.0
+    max_temp_k: float = 0.0
+    delta_t_max_k: float = 0.0
+    max_displacement_um: float = 0.0
+    max_slope_rad: float = 0.0
+    thermal_converged: bool = False
+    thermal_iterations: int = 0
 
+@dataclass
+class ThermalSpectrumPoint:
+    energy_eV: float = 0.0
+    max_temp_k: float = 0.0
+    delta_t_max_k: float = 0.0
+    max_displacement_um: float = 0.0
+    max_slope_rad: float = 0.0
+    mean_slope_rad: float = 0.0
+    pzt_pitch_bias_rad: float = 0.0
+    pzt_pitch_bias_urad: float = 0.0
+    beam_height_error_um: float = 0.0
+    compensated_height_error_um: float = 0.0
+    thermal_converged: bool = False
+    thermal_iterations: int = 0
 
 @dataclass
 class SpectrumPoint:
@@ -345,13 +646,44 @@ class SpectrumPoint:
     path_length_mm: float = 0.0
     crystal1_pitch_deg: float = 0.0
     crystal2_pitch_deg: float = 0.0
+    crystal2_pitch_bias_deg: float = 0.0
     crystal2_x_mm: float = 0.0
     crystal2_y_mm: float = 0.0
+    thermal: ThermalSpectrumPoint = field(default_factory=ThermalSpectrumPoint)
 
 
 class PhotonTransport:
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, thermal_config: Optional[ThermalConfig] = None):
         self._rng = np.random.default_rng(seed)
+        self._thermal_config = thermal_config or ThermalConfig()
+        self._thermal_enabled = self._thermal_config.enabled
+        if self._thermal_enabled:
+            self._thermal_solver = ThermalFDMSolver(self._thermal_config)
+        else:
+            self._thermal_solver = None
+
+    @property
+    def thermal_enabled(self) -> bool:
+        return self._thermal_enabled
+
+    @thermal_enabled.setter
+    def thermal_enabled(self, value: bool):
+        self._thermal_enabled = value
+
+    @property
+    def thermal_solver(self) -> Optional[ThermalFDMSolver]:
+        return self._thermal_solver
+
+    def _run_thermal_solve(self, energy_eV: float, bragg_angle_rad: float,
+                            offset_mm: float) -> Optional[ThermalState]:
+        if not self._thermal_enabled or self._thermal_solver is None:
+            return None
+        self._thermal_solver.set_bragg_angle(bragg_angle_rad)
+        self._thermal_solver.set_beam_position(0.0, 0.0)
+        state = self._thermal_solver.solve_steady_state()
+        state.compensation = self._thermal_solver.compute_pzt_compensation(
+            state.deformation, offset_mm, bragg_angle_rad)
+        return state
 
     def _crystal_absorption(self, energy_eV: float, path_length_mm: float) -> float:
         mu = si_absorption_coefficient(energy_eV)
@@ -461,6 +793,24 @@ class PhotonTransport:
             result.crystal1_absorption = c1_abs / num_photons
             result.crystal2_absorption = c2_abs / num_photons
 
+        if self._thermal_enabled:
+            try:
+                ts = self._run_thermal_solve(energy_eV, bragg_angle_rad, offset_mm)
+                if ts is not None:
+                    result.pzt_pitch_bias_rad = ts.compensation.pitch_bias_rad
+                    result.pzt_pitch_bias_urad = ts.compensation.pitch_bias_urad
+                    result.beam_height_error_um = ts.compensation.estimated_beam_height_error_um
+                    result.compensated_height_error_um = ts.compensation.compensated_height_error_um
+                    result.max_temp_k = ts.max_temp_k
+                    result.delta_t_max_k = ts.delta_t_max_k
+                    result.max_displacement_um = ts.deformation.max_displacement_um
+                    result.max_slope_rad = ts.deformation.max_slope_rad
+                    result.thermal_converged = ts.converged
+                    result.thermal_iterations = ts.iterations
+            except Exception:
+                result.thermal_converged = False
+                result.thermal_iterations = 0
+
         return result
 
     def simulate_single_energy_vectorized(self, energy_eV: float, bragg_angle_rad: float,
@@ -551,6 +901,24 @@ class PhotonTransport:
         result.crystal1_absorption = abs_fraction * n_ref1 / num_photons
         result.crystal2_absorption = abs_fraction * n_both / num_photons
 
+        if self._thermal_enabled:
+            try:
+                ts = self._run_thermal_solve(energy_eV, bragg_angle_rad, offset_mm)
+                if ts is not None:
+                    result.pzt_pitch_bias_rad = ts.compensation.pitch_bias_rad
+                    result.pzt_pitch_bias_urad = ts.compensation.pitch_bias_urad
+                    result.beam_height_error_um = ts.compensation.estimated_beam_height_error_um
+                    result.compensated_height_error_um = ts.compensation.compensated_height_error_um
+                    result.max_temp_k = ts.max_temp_k
+                    result.delta_t_max_k = ts.delta_t_max_k
+                    result.max_displacement_um = ts.deformation.max_displacement_um
+                    result.max_slope_rad = ts.deformation.max_slope_rad
+                    result.thermal_converged = ts.converged
+                    result.thermal_iterations = ts.iterations
+            except Exception:
+                result.thermal_converged = False
+                result.thermal_iterations = 0
+
         return result
 
     def simulate_energy_scan(self, energy_start_eV: float, energy_end_eV: float,
@@ -580,8 +948,23 @@ class PhotonTransport:
                 path_length_mm=res.total_path_length_mm,
                 crystal1_pitch_deg=bragg_angles_rad[i] * RAD_TO_DEG,
                 crystal2_pitch_deg=bragg_angles_rad[i] * RAD_TO_DEG,
+                crystal2_pitch_bias_deg=res.pzt_pitch_bias_rad * RAD_TO_DEG,
                 crystal2_x_mm=(offset_mm / 2.0) / sin_theta,
                 crystal2_y_mm=offset_mm,
+            )
+            pt.thermal = ThermalSpectrumPoint(
+                energy_eV=e,
+                max_temp_k=res.max_temp_k,
+                delta_t_max_k=res.delta_t_max_k,
+                max_displacement_um=res.max_displacement_um,
+                max_slope_rad=res.max_slope_rad,
+                mean_slope_rad=0.0,
+                pzt_pitch_bias_rad=res.pzt_pitch_bias_rad,
+                pzt_pitch_bias_urad=res.pzt_pitch_bias_urad,
+                beam_height_error_um=res.beam_height_error_um,
+                compensated_height_error_um=res.compensated_height_error_um,
+                thermal_converged=res.thermal_converged,
+                thermal_iterations=res.thermal_iterations,
             )
             spectrum.append(pt)
 
@@ -603,8 +986,18 @@ class HDF5Writer:
             path_length = np.array([p.path_length_mm for p in spectrum])
             c1_pitch = np.array([p.crystal1_pitch_deg for p in spectrum])
             c2_pitch = np.array([p.crystal2_pitch_deg for p in spectrum])
+            c2_bias = np.array([p.crystal2_pitch_bias_deg for p in spectrum])
             c2_x = np.array([p.crystal2_x_mm for p in spectrum])
             c2_y = np.array([p.crystal2_y_mm for p in spectrum])
+            max_temp = np.array([p.thermal.max_temp_k for p in spectrum])
+            delta_t = np.array([p.thermal.delta_t_max_k for p in spectrum])
+            max_disp = np.array([p.thermal.max_displacement_um for p in spectrum])
+            max_slope = np.array([p.thermal.max_slope_rad for p in spectrum])
+            mean_slope = np.array([p.thermal.mean_slope_rad for p in spectrum])
+            pzt_bias_rad = np.array([p.thermal.pzt_pitch_bias_rad for p in spectrum])
+            pzt_bias_urad = np.array([p.thermal.pzt_pitch_bias_urad for p in spectrum])
+            height_err = np.array([p.thermal.beam_height_error_um for p in spectrum])
+            comp_err = np.array([p.thermal.compensated_height_error_um for p in spectrum])
 
             spec_grp = f.create_group('spectrum')
             spec_grp.create_dataset('energy_eV', data=energy)
@@ -615,6 +1008,7 @@ class HDF5Writer:
             crystal_grp = f.create_group('crystal_positions')
             crystal_grp.create_dataset('crystal1_pitch_deg', data=c1_pitch)
             crystal_grp.create_dataset('crystal2_pitch_deg', data=c2_pitch)
+            crystal_grp.create_dataset('crystal2_pitch_bias_deg', data=c2_bias)
             crystal_grp.create_dataset('crystal2_x_mm', data=c2_x)
             crystal_grp.create_dataset('crystal2_y_mm', data=c2_y)
 
@@ -626,6 +1020,19 @@ class HDF5Writer:
                 bragg_grp.create_dataset('bragg_angle_deg', data=bragg_angle)
                 bragg_grp.create_dataset('wavelength_A', data=wavelength)
                 bragg_grp.create_dataset('d_spacing_A', data=d_sp)
+
+            thermal_grp = f.create_group('thermal')
+            thermal_grp.create_dataset('max_temperature_k', data=max_temp)
+            thermal_grp.create_dataset('delta_t_max_k', data=delta_t)
+            thermal_grp.create_dataset('max_displacement_um', data=max_disp)
+            thermal_grp.create_dataset('max_slope_rad', data=max_slope)
+            thermal_grp.create_dataset('mean_slope_rad', data=mean_slope)
+
+            pzt_grp = f.create_group('pzt_compensation')
+            pzt_grp.create_dataset('pitch_bias_rad', data=pzt_bias_rad)
+            pzt_grp.create_dataset('pitch_bias_urad', data=pzt_bias_urad)
+            pzt_grp.create_dataset('uncompensated_beam_height_error_um', data=height_err)
+            pzt_grp.create_dataset('compensated_height_error_um', data=comp_err)
 
     @staticmethod
     def write_simulation_report(filename: str,
@@ -656,8 +1063,18 @@ class HDF5Writer:
             path_length = np.array([p.path_length_mm for p in spectrum])
             c1_pitch = np.array([p.crystal1_pitch_deg for p in spectrum])
             c2_pitch = np.array([p.crystal2_pitch_deg for p in spectrum])
+            c2_bias = np.array([p.crystal2_pitch_bias_deg for p in spectrum])
             c2_x = np.array([p.crystal2_x_mm for p in spectrum])
             c2_y = np.array([p.crystal2_y_mm for p in spectrum])
+            max_temp = np.array([p.thermal.max_temp_k for p in spectrum])
+            delta_t = np.array([p.thermal.delta_t_max_k for p in spectrum])
+            max_disp = np.array([p.thermal.max_displacement_um for p in spectrum])
+            max_slope = np.array([p.thermal.max_slope_rad for p in spectrum])
+            mean_slope = np.array([p.thermal.mean_slope_rad for p in spectrum])
+            pzt_bias_rad = np.array([p.thermal.pzt_pitch_bias_rad for p in spectrum])
+            pzt_bias_urad = np.array([p.thermal.pzt_pitch_bias_urad for p in spectrum])
+            height_err = np.array([p.thermal.beam_height_error_um for p in spectrum])
+            comp_err = np.array([p.thermal.compensated_height_error_um for p in spectrum])
 
             spec_grp = f.create_group('spectrum')
             spec_grp.create_dataset('energy_eV', data=energy)
@@ -668,6 +1085,7 @@ class HDF5Writer:
             crystal_grp = f.create_group('crystal_positions')
             crystal_grp.create_dataset('crystal1_pitch_deg', data=c1_pitch)
             crystal_grp.create_dataset('crystal2_pitch_deg', data=c2_pitch)
+            crystal_grp.create_dataset('crystal2_pitch_bias_deg', data=c2_bias)
             crystal_grp.create_dataset('crystal2_x_mm', data=c2_x)
             crystal_grp.create_dataset('crystal2_y_mm', data=c2_y)
 
@@ -695,6 +1113,19 @@ class HDF5Writer:
                 dcm_grp.create_dataset('crystal2_x_mm', data=dcm_c2_x)
                 dcm_grp.create_dataset('crystal2_y_mm', data=dcm_c2_y)
 
+            thermal_grp = f.create_group('thermal')
+            thermal_grp.create_dataset('max_temperature_k', data=max_temp)
+            thermal_grp.create_dataset('delta_t_max_k', data=delta_t)
+            thermal_grp.create_dataset('max_displacement_um', data=max_disp)
+            thermal_grp.create_dataset('max_slope_rad', data=max_slope)
+            thermal_grp.create_dataset('mean_slope_rad', data=mean_slope)
+
+            pzt_grp = f.create_group('pzt_compensation')
+            pzt_grp.create_dataset('pitch_bias_rad', data=pzt_bias_rad)
+            pzt_grp.create_dataset('pitch_bias_urad', data=pzt_bias_urad)
+            pzt_grp.create_dataset('uncompensated_beam_height_error_um', data=height_err)
+            pzt_grp.create_dataset('compensated_height_error_um', data=comp_err)
+
 
 @dataclass
 class SimulationConfig:
@@ -709,6 +1140,7 @@ class SimulationConfig:
     miller_l: int = 1
     lattice_constant_A: float = 5.431020511
     heartbeat_timeout_sec: float = 300.0
+    thermal_config: ThermalConfig = field(default_factory=ThermalConfig)
 
 
 @dataclass
@@ -782,7 +1214,7 @@ class MPIScheduler:
         local_start = self._rank * points_per_rank + min(self._rank, remainder)
         local_count = points_per_rank + (1 if self._rank < remainder else 0)
 
-        transport = PhotonTransport(seed=42 + self._rank)
+        transport = PhotonTransport(seed=42 + self._rank, thermal_config=config.thermal_config)
 
         step = (config.energy_end_eV - config.energy_start_eV) / (config.num_energy_points - 1)
         local_spectrum = []
@@ -806,8 +1238,23 @@ class MPIScheduler:
                     path_length_mm=res.total_path_length_mm,
                     crystal1_pitch_deg=bragg_angles[i] * RAD_TO_DEG,
                     crystal2_pitch_deg=bragg_angles[i] * RAD_TO_DEG,
+                    crystal2_pitch_bias_deg=res.pzt_pitch_bias_rad * RAD_TO_DEG,
                     crystal2_x_mm=(config.offset_mm / 2.0) / sin_theta,
                     crystal2_y_mm=config.offset_mm,
+                )
+                pt.thermal = ThermalSpectrumPoint(
+                    energy_eV=e,
+                    max_temp_k=res.max_temp_k,
+                    delta_t_max_k=res.delta_t_max_k,
+                    max_displacement_um=res.max_displacement_um,
+                    max_slope_rad=res.max_slope_rad,
+                    mean_slope_rad=0.0,
+                    pzt_pitch_bias_rad=res.pzt_pitch_bias_rad,
+                    pzt_pitch_bias_urad=res.pzt_pitch_bias_urad,
+                    beam_height_error_um=res.beam_height_error_um,
+                    compensated_height_error_um=res.compensated_height_error_um,
+                    thermal_converged=res.thermal_converged,
+                    thermal_iterations=res.thermal_iterations,
                 )
             except Exception:
                 local_error = True
@@ -853,11 +1300,14 @@ class BeamlineConfig:
     miller_l: int = 1
     lattice_constant_A: float = 5.431020511
     heartbeat_timeout_sec: float = 300.0
+    thermal_config: ThermalConfig = field(default_factory=ThermalConfig)
 
 
 class BeamlineSimulator:
     def __init__(self, config: Optional[BeamlineConfig] = None):
         self._config = config or BeamlineConfig()
+        if self._config.thermal_config is not None:
+            self._config.thermal_config.dcm_offset_mm = self._config.offset_mm
         self._solver = BraggSolver(
             self._config.miller_h,
             self._config.miller_k,
@@ -926,6 +1376,7 @@ class BeamlineSimulator:
                 miller_k=self._config.miller_k,
                 miller_l=self._config.miller_l,
                 lattice_constant_A=self._config.lattice_constant_A,
+                thermal_config=self._config.thermal_config,
             )
             scheduler = MPIScheduler()
             self._result = scheduler.run_simulation(cfg)
@@ -941,7 +1392,7 @@ class BeamlineSimulator:
             bragg_angles = [s.bragg_angle_rad for s in bragg_solutions]
             darwin_widths = [self._solver.darwin_width_rad(s.energy_eV) for s in bragg_solutions]
 
-            transport = PhotonTransport(seed=42)
+            transport = PhotonTransport(seed=42, thermal_config=self._config.thermal_config)
             spectrum = transport.simulate_energy_scan(
                 self._config.energy_start_eV, self._config.energy_end_eV,
                 self._config.num_energy_points, bragg_angles,
@@ -988,8 +1439,17 @@ class BeamlineSimulator:
             data['path_length_mm'] = np.array([p.path_length_mm for p in sp])
             data['crystal1_pitch_deg'] = np.array([p.crystal1_pitch_deg for p in sp])
             data['crystal2_pitch_deg'] = np.array([p.crystal2_pitch_deg for p in sp])
+            data['crystal2_pitch_bias_deg'] = np.array([p.crystal2_pitch_bias_deg for p in sp])
             data['crystal2_x_mm'] = np.array([p.crystal2_x_mm for p in sp])
             data['crystal2_y_mm'] = np.array([p.crystal2_y_mm for p in sp])
+            data['thermal_max_temp_k'] = np.array([p.thermal.max_temp_k for p in sp])
+            data['thermal_delta_t_max_k'] = np.array([p.thermal.delta_t_max_k for p in sp])
+            data['thermal_max_displacement_um'] = np.array([p.thermal.max_displacement_um for p in sp])
+            data['thermal_max_slope_rad'] = np.array([p.thermal.max_slope_rad for p in sp])
+            data['pzt_pitch_bias_rad'] = np.array([p.thermal.pzt_pitch_bias_rad for p in sp])
+            data['pzt_pitch_bias_urad'] = np.array([p.thermal.pzt_pitch_bias_urad for p in sp])
+            data['beam_height_error_um'] = np.array([p.thermal.beam_height_error_um for p in sp])
+            data['compensated_height_error_um'] = np.array([p.thermal.compensated_height_error_um for p in sp])
 
         if result.bragg_solutions:
             bs = result.bragg_solutions

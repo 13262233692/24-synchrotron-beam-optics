@@ -22,6 +22,7 @@ set(CORE_SOURCES
     src/core/physics_constants.cpp
     src/core/bragg_solver.cpp
     src/core/crystal_geometry.cpp
+    src/core/thermal_solver.cpp
     src/core/photon_transport.cpp
     src/core/hdf5_writer.cpp
     src/mpi/mpi_scheduler.cpp

@@ -10,7 +10,10 @@
 namespace synchrotron {
 
 PhotonTransport::PhotonTransport(uint64_t seed)
-    : base_seed_(seed) {}
+    : base_seed_(seed),
+      thermal_enabled_(true),
+      thermal_cfg_(default_thermal_config()),
+      thermal_solver_(thermal_cfg_, si_thermal_props_300k()) {}
 
 double PhotonTransport::flush_weight(double weight) const {
     return synchrotron::flush_subnormal(weight);
@@ -49,6 +52,23 @@ bool PhotonTransport::reflect_from_crystal(std::mt19937_64& rng,
     double reflectivity = flush_subnormal(x * x);
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     return dist(rng) < reflectivity;
+}
+
+ThermalState PhotonTransport::run_thermal_solve(
+    double energy_eV,
+    double bragg_angle_rad,
+    double offset_mm) {
+    ScopedFTZ ftz;
+    (void)energy_eV;
+    (void)offset_mm;
+
+    thermal_solver_.set_bragg_angle(bragg_angle_rad);
+    thermal_solver_.set_beam_position(0.0, 0.0);
+
+    ThermalState state = thermal_solver_.solve_steady_state();
+    state.compensation = thermal_solver_.compute_pzt_compensation(
+        state.deformation, offset_mm, bragg_angle_rad);
+    return state;
 }
 
 PhotonTransportResult PhotonTransport::simulate_single_energy(
@@ -228,6 +248,25 @@ PhotonTransportResult PhotonTransport::simulate_single_energy(
         result.crystal2_absorption = sum_c2_abs / num_photons;
     }
 
+    if (thermal_enabled_) {
+        try {
+            ThermalState ts = run_thermal_solve(energy_eV, bragg_angle_rad, offset_mm);
+            result.pzt_pitch_bias_rad = ts.compensation.pitch_bias_rad;
+            result.pzt_pitch_bias_urad = ts.compensation.pitch_bias_urad;
+            result.beam_height_error_um = ts.compensation.estimated_beam_height_error_um;
+            result.compensated_height_error_um = ts.compensation.compensated_height_error_um;
+            result.max_temp_k = ts.max_temp_k;
+            result.delta_t_max_k = ts.delta_t_max_k;
+            result.max_displacement_um = ts.deformation.max_displacement_um;
+            result.max_slope_rad = ts.deformation.max_slope_rad;
+            result.thermal_converged = ts.converged;
+            result.thermal_iterations = ts.iterations;
+        } catch (...) {
+            result.thermal_converged = false;
+            result.thermal_iterations = 0;
+        }
+    }
+
     return result;
 }
 
@@ -264,10 +303,24 @@ std::vector<SpectrumPoint> PhotonTransport::simulate_energy_scan(
         pt.path_length_mm = res.total_path_length_mm;
         pt.crystal1_pitch_deg = bragg_angles_rad[i] * RAD_TO_DEG;
         pt.crystal2_pitch_deg = bragg_angles_rad[i] * RAD_TO_DEG;
+        pt.crystal2_pitch_bias_deg = res.pzt_pitch_bias_rad * RAD_TO_DEG;
 
         double sin_theta = std::sin(bragg_angles_rad[i]);
         pt.crystal2_x_mm = (offset_mm / 2.0) / sin_theta;
         pt.crystal2_y_mm = offset_mm;
+
+        pt.thermal.energy_eV = e;
+        pt.thermal.max_temp_k = res.max_temp_k;
+        pt.thermal.delta_t_max_k = res.delta_t_max_k;
+        pt.thermal.max_displacement_um = res.max_displacement_um;
+        pt.thermal.max_slope_rad = res.max_slope_rad;
+        pt.thermal.mean_slope_rad = 0.0;
+        pt.thermal.pzt_pitch_bias_rad = res.pzt_pitch_bias_rad;
+        pt.thermal.pzt_pitch_bias_urad = res.pzt_pitch_bias_urad;
+        pt.thermal.beam_height_error_um = res.beam_height_error_um;
+        pt.thermal.compensated_height_error_um = res.compensated_height_error_um;
+        pt.thermal.thermal_converged = res.thermal_converged;
+        pt.thermal.thermal_iterations = res.thermal_iterations;
 
         spectrum.push_back(pt);
     }
