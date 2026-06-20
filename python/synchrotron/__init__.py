@@ -19,6 +19,12 @@ from .core import (
     wavelength_to_energy_eV,
     SI_LATTICE_CONSTANT_A,
     HC_eVA,
+    _is_subnormal,
+    _flush_subnormal,
+    _flush_subnormal_array,
+    _safe_exp,
+    _enable_ftz,
+    _restore_fp_state,
 )
 
 __all__ = [
@@ -42,4 +48,10 @@ __all__ = [
     'wavelength_to_energy_eV',
     'SI_LATTICE_CONSTANT_A',
     'HC_eVA',
+    '_is_subnormal',
+    '_flush_subnormal',
+    '_flush_subnormal_array',
+    '_safe_exp',
+    '_enable_ftz',
+    '_restore_fp_state',
 ]

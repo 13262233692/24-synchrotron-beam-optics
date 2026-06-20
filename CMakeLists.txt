@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(HDF5 REQUIRED COMPONENTS CXX)
+find_package(OpenMP)
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
 
 include(FetchContent)
@@ -36,8 +37,47 @@ target_link_libraries(synchrotron_core PUBLIC
     HDF5::HDF5_CXX
 )
 
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(synchrotron_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+if(MSVC)
+    target_compile_options(synchrotron_core PRIVATE
+        /fp:fast
+        /O2
+    )
+    target_compile_definitions(synchrotron_core PUBLIC
+        _CRT_SECURE_NO_WARNINGS
+        __SSE__
+    )
+else()
+    target_compile_options(synchrotron_core PRIVATE
+        -ffp-contract=fast
+        -fno-math-errno
+        -fno-trapping-math
+        -O2
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(synchrotron_core PRIVATE
+            -march=native
+            -msse2
+        )
+    endif()
+endif()
+
 pybind11_add_module(_synchrotron src/bindings.cpp)
 target_link_libraries(_synchrotron PRIVATE synchrotron_core pybind11::module)
+
+if(MSVC)
+    target_compile_options(_synchrotron PRIVATE /fp:fast)
+else()
+    target_compile_options(_synchrotron PRIVATE
+        -ffp-contract=fast
+        -fno-math-errno
+        -fno-trapping-math
+    )
+endif()
+
 set_target_properties(_synchrotron PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/synchrotron
     PREFIX ""

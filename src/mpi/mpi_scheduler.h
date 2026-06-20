@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <string>
+#include <chrono>
 #include "photon_transport.h"
 #include "bragg_solver.h"
 #include "crystal_geometry.h"
@@ -19,6 +20,7 @@ struct SimulationConfig {
     int miller_k;
     int miller_l;
     double lattice_constant_A;
+    double heartbeat_timeout_sec;
 };
 
 struct SimulationResult {
@@ -45,7 +47,11 @@ private:
     bool owns_mpi_;
 
     std::vector<SpectrumPoint> gather_spectrum(
-        const std::vector<SpectrumPoint>& local_spectrum);
+        const std::vector<SpectrumPoint>& local_spectrum,
+        double heartbeat_timeout_sec);
+
+    void send_heartbeat(int tag = 9999);
+    bool check_heartbeat(int source, double timeout_sec, int tag = 9999);
 };
 
 }

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import struct
+import ctypes
+import sys
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
@@ -21,6 +24,70 @@ SI_L2_EDGE_eV = 99.8
 SI_L3_EDGE_eV = 99.2
 
 R_ELECTRON_CM = 2.8179403227e-5
+
+DBL_MIN_NORMAL = 2.2250738585072014e-308
+
+
+def _is_subnormal(x: float) -> bool:
+    if x == 0.0:
+        return False
+    return abs(x) < DBL_MIN_NORMAL
+
+
+def _flush_subnormal(x: float) -> float:
+    if _is_subnormal(x):
+        return 0.0
+    return x
+
+
+def _flush_subnormal_array(arr: np.ndarray) -> np.ndarray:
+    subnormal = (arr != 0.0) & (np.abs(arr) < DBL_MIN_NORMAL)
+    arr[subnormal] = 0.0
+    return arr
+
+
+def _safe_exp(x: float) -> float:
+    result = math.exp(x)
+    return _flush_subnormal(result)
+
+
+def _enable_ftz() -> Optional[int]:
+    try:
+        if sys.platform == 'win32':
+            _MM_SET_FLUSH_ZERO_MODE = 0x8000
+            _MM_SET_DENORMALS_ZERO_MODE = 0x0040
+            _mm_setcsr = ctypes.cdll.msvcrt._mm_setcsr
+            _mm_getcsr = ctypes.cdll.msvcrt._mm_getcsr
+            _mm_setcsr.restype = None
+            _mm_getcsr.restype = ctypes.c_uint
+            old = _mm_getcsr()
+            _mm_setcsr(old | _MM_SET_FLUSH_ZERO_MODE | _MM_SET_DENORMALS_ZERO_MODE)
+            return old
+        else:
+            libc = ctypes.CDLL("libc.so.6")
+            old = ctypes.c_uint()
+            libc._mm_getcsr(ctypes.byref(old))
+            _MM_SET_FLUSH_ZERO_MODE = 0x8000
+            _MM_SET_DENORMALS_ZERO_MODE = 0x0040
+            libc._mm_setcsr(old.value | _MM_SET_FLUSH_ZERO_MODE | _MM_SET_DENORMALS_ZERO_MODE)
+            return old.value
+    except Exception:
+        return None
+
+
+def _restore_fp_state(old: Optional[int]) -> None:
+    if old is None:
+        return
+    try:
+        if sys.platform == 'win32':
+            _mm_setcsr = ctypes.cdll.msvcrt._mm_setcsr
+            _mm_setcsr.restype = None
+            _mm_setcsr(old)
+        else:
+            libc = ctypes.CDLL("libc.so.6")
+            libc._mm_setcsr(old)
+    except Exception:
+        pass
 
 
 def d_spacing_si111() -> float:
@@ -289,27 +356,54 @@ class PhotonTransport:
     def _crystal_absorption(self, energy_eV: float, path_length_mm: float) -> float:
         mu = si_absorption_coefficient(energy_eV)
         path_cm = path_length_mm * 0.1
-        return 1.0 - math.exp(-mu * path_cm)
+        transmission = _safe_exp(-mu * path_cm)
+        absorption = _flush_subnormal(1.0 - transmission)
+        return absorption
 
     def _sample_angular_deviation(self, darwin_width_rad: float) -> float:
         u = self._rng.uniform(0.0, 1.0)
         return darwin_width_rad * (2.0 * u - 1.0)
 
     def _reflect_from_crystal(self, deviation: float, darwin_width_rad: float) -> bool:
-        normalized = deviation / (darwin_width_rad / 2.0)
+        half_dw = darwin_width_rad / 2.0
+        if half_dw == 0.0:
+            return False
+        normalized = deviation / half_dw
         if abs(normalized) <= 1.0:
             return True
-        x = abs(normalized) - math.sqrt(normalized * normalized - 1.0)
-        reflectivity = x * x
+        sq = normalized * normalized - 1.0
+        if sq < 0.0:
+            return False
+        x = abs(normalized) - math.sqrt(sq)
+        reflectivity = _flush_subnormal(x * x)
         return self._rng.uniform() < reflectivity
 
     def simulate_single_energy(self, energy_eV: float, bragg_angle_rad: float,
                                offset_mm: float, crystal_thickness_mm: float,
                                darwin_width_rad: float,
                                num_photons: int) -> PhotonTransportResult:
+        saved_mxcsr = _enable_ftz()
+        try:
+            return self._simulate_single_energy_impl(
+                energy_eV, bragg_angle_rad, offset_mm,
+                crystal_thickness_mm, darwin_width_rad, num_photons)
+        except Exception:
+            return PhotonTransportResult()
+        finally:
+            _restore_fp_state(saved_mxcsr)
+
+    def _simulate_single_energy_impl(self, energy_eV: float, bragg_angle_rad: float,
+                                      offset_mm: float, crystal_thickness_mm: float,
+                                      darwin_width_rad: float,
+                                      num_photons: int) -> PhotonTransportResult:
         sin_theta = math.sin(bragg_angle_rad)
         cos_theta = math.cos(bragg_angle_rad)
         path_in_crystal = crystal_thickness_mm / sin_theta
+
+        mu = si_absorption_coefficient(energy_eV)
+        path_cm = path_in_crystal * 0.1
+        abs_fraction = _flush_subnormal(1.0 - _safe_exp(-mu * path_cm))
+        surv_fraction = _flush_subnormal(1.0 - abs_fraction)
 
         reflected1 = 0
         reflected2 = 0
@@ -331,9 +425,8 @@ class PhotonTransport:
                 continue
             reflected1 += 1
 
-            abs_frac1 = self._crystal_absorption(energy_eV, path_in_crystal)
-            weight *= (1.0 - abs_frac1)
-            c1_abs += abs_frac1
+            weight = _flush_subnormal(weight * surv_fraction)
+            c1_abs += abs_fraction
             photon_path += path_in_crystal
 
             dev2 = self._sample_angular_deviation(darwin_width_rad)
@@ -342,9 +435,8 @@ class PhotonTransport:
                 continue
             reflected2 += 1
 
-            abs_frac2 = self._crystal_absorption(energy_eV, path_in_crystal)
-            weight *= (1.0 - abs_frac2)
-            c2_abs += abs_frac2
+            weight = _flush_subnormal(weight * surv_fraction)
+            c2_abs += abs_fraction
             photon_path += path_in_crystal
 
             free_path = offset_mm / cos_theta
@@ -360,8 +452,8 @@ class PhotonTransport:
             result.reflectivity_crystal1 = reflected1 / num_photons
             result.reflectivity_crystal2 = reflected2 / num_photons if reflected1 > 0 else 0.0
             result.transmission_fraction = reflected2 / num_photons
-            result.absorbed_weight = absorbed_weight / num_photons
-            result.transmitted_weight = transmitted_weight / num_photons
+            result.absorbed_weight = _flush_subnormal(absorbed_weight / num_photons)
+            result.transmitted_weight = _flush_subnormal(transmitted_weight / num_photons)
             if reflected2 > 0:
                 result.total_path_length_mm = total_path / reflected2
                 result.crystal1_path_mm = c1_path / reflected2
@@ -375,6 +467,20 @@ class PhotonTransport:
                                           offset_mm: float, crystal_thickness_mm: float,
                                           darwin_width_rad: float,
                                           num_photons: int) -> PhotonTransportResult:
+        saved_mxcsr = _enable_ftz()
+        try:
+            return self._simulate_single_energy_vectorized_impl(
+                energy_eV, bragg_angle_rad, offset_mm,
+                crystal_thickness_mm, darwin_width_rad, num_photons)
+        except Exception:
+            return PhotonTransportResult()
+        finally:
+            _restore_fp_state(saved_mxcsr)
+
+    def _simulate_single_energy_vectorized_impl(self, energy_eV: float, bragg_angle_rad: float,
+                                                 offset_mm: float, crystal_thickness_mm: float,
+                                                 darwin_width_rad: float,
+                                                 num_photons: int) -> PhotonTransportResult:
         sin_theta = math.sin(bragg_angle_rad)
         cos_theta = math.cos(bragg_angle_rad)
         path_in_crystal = crystal_thickness_mm / sin_theta
@@ -382,27 +488,40 @@ class PhotonTransport:
 
         mu = si_absorption_coefficient(energy_eV)
         path_cm = path_in_crystal * 0.1
-        abs_fraction = 1.0 - math.exp(-mu * path_cm)
+        abs_fraction = _flush_subnormal(1.0 - _safe_exp(-mu * path_cm))
+
+        half_dw = darwin_width_rad / 2.0
+        if half_dw == 0.0:
+            result = PhotonTransportResult()
+            result.absorbed_weight = 1.0
+            result.absorption_fraction = 1.0
+            return result
 
         dev1 = self._rng.uniform(-darwin_width_rad, darwin_width_rad, num_photons)
         dev2 = self._rng.uniform(-darwin_width_rad, darwin_width_rad, num_photons)
 
-        normalized1 = dev1 / (darwin_width_rad / 2.0)
-        normalized2 = dev2 / (darwin_width_rad / 2.0)
+        normalized1 = dev1 / half_dw
+        normalized2 = dev2 / half_dw
 
         reflect1 = np.abs(normalized1) <= 1.0
         ref1_outside = ~reflect1
         if np.any(ref1_outside):
-            x1 = np.abs(normalized1[ref1_outside]) - np.sqrt(normalized1[ref1_outside] ** 2 - 1.0)
-            r1 = x1 ** 2
+            sq1 = normalized1[ref1_outside] ** 2 - 1.0
+            valid1 = sq1 >= 0.0
+            x1 = np.zeros_like(sq1)
+            x1[valid1] = np.abs(normalized1[ref1_outside][valid1]) - np.sqrt(sq1[valid1])
+            r1 = _flush_subnormal_array(x1 ** 2)
             u1 = self._rng.uniform(size=r1.shape)
             reflect1[ref1_outside] = u1 < r1
 
         reflect2 = np.abs(normalized2) <= 1.0
         ref2_outside = ~reflect2
         if np.any(ref2_outside):
-            x2 = np.abs(normalized2[ref2_outside]) - np.sqrt(normalized2[ref2_outside] ** 2 - 1.0)
-            r2 = x2 ** 2
+            sq2 = normalized2[ref2_outside] ** 2 - 1.0
+            valid2 = sq2 >= 0.0
+            x2 = np.zeros_like(sq2)
+            x2[valid2] = np.abs(normalized2[ref2_outside][valid2]) - np.sqrt(sq2[valid2])
+            r2 = _flush_subnormal_array(x2 ** 2)
             u2 = self._rng.uniform(size=r2.shape)
             reflect2[ref2_outside] = u2 < r2
 
@@ -413,8 +532,12 @@ class PhotonTransport:
         weight_after_c1 = (1.0 - abs_fraction) * reflect1.astype(float)
         weight_after_c2 = weight_after_c1 * (1.0 - abs_fraction) * reflect2.astype(float)
 
-        transmitted_weight = float(np.sum(weight_after_c2)) / num_photons
-        absorbed_weight = 1.0 - float(np.sum(weight_after_c1 * (1.0 - abs_fraction) * reflect2.astype(float))) / num_photons
+        _flush_subnormal_array(weight_after_c1)
+        _flush_subnormal_array(weight_after_c2)
+
+        transmitted_weight = _flush_subnormal(float(np.sum(weight_after_c2)) / num_photons)
+        absorbed_weight = _flush_subnormal(
+            1.0 - float(np.sum(weight_after_c1 * (1.0 - abs_fraction) * reflect2.astype(float))) / num_photons)
 
         result = PhotonTransportResult()
         result.reflectivity_crystal1 = n_ref1 / num_photons
@@ -585,6 +708,7 @@ class SimulationConfig:
     miller_k: int = 1
     miller_l: int = 1
     lattice_constant_A: float = 5.431020511
+    heartbeat_timeout_sec: float = 300.0
 
 
 @dataclass
@@ -609,7 +733,33 @@ class MPIScheduler:
     def size(self) -> int:
         return self._size
 
+    def _send_heartbeat(self, tag: int = 9999):
+        try:
+            self._comm.send(1, dest=0, tag=tag)
+        except Exception:
+            pass
+
+    def _check_heartbeat(self, source: int, timeout_sec: float, tag: int = 9999) -> bool:
+        import time
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if self._comm.iprobe(source=source, tag=tag):
+                try:
+                    self._comm.recv(source=source, tag=tag)
+                except Exception:
+                    pass
+                return True
+            time.sleep(0.01)
+        return False
+
     def run_simulation(self, config: SimulationConfig) -> SimulationResult:
+        saved_mxcsr = _enable_ftz()
+        try:
+            return self._run_simulation_impl(config)
+        finally:
+            _restore_fp_state(saved_mxcsr)
+
+    def _run_simulation_impl(self, config: SimulationConfig) -> SimulationResult:
         solver = BraggSolver(config.miller_h, config.miller_k, config.miller_l,
                              config.lattice_constant_A)
 
@@ -636,35 +786,47 @@ class MPIScheduler:
 
         step = (config.energy_end_eV - config.energy_start_eV) / (config.num_energy_points - 1)
         local_spectrum = []
+        local_error = False
+
         for i in range(local_start, local_start + local_count):
             if i >= total_points:
                 break
             e = config.energy_start_eV + i * step
-            res = transport.simulate_single_energy_vectorized(
-                e, bragg_angles[i], config.offset_mm,
-                config.crystal_thickness_mm, darwin_widths[i],
-                config.num_photons_per_point
-            )
-            sin_theta = math.sin(bragg_angles[i])
-            pt = SpectrumPoint(
-                energy_eV=e,
-                transmitted_intensity=res.transmitted_weight,
-                absorption_fraction=res.absorbed_weight,
-                path_length_mm=res.total_path_length_mm,
-                crystal1_pitch_deg=bragg_angles[i] * RAD_TO_DEG,
-                crystal2_pitch_deg=bragg_angles[i] * RAD_TO_DEG,
-                crystal2_x_mm=(config.offset_mm / 2.0) / sin_theta,
-                crystal2_y_mm=config.offset_mm,
-            )
+            try:
+                res = transport.simulate_single_energy_vectorized(
+                    e, bragg_angles[i], config.offset_mm,
+                    config.crystal_thickness_mm, darwin_widths[i],
+                    config.num_photons_per_point
+                )
+                sin_theta = math.sin(bragg_angles[i])
+                pt = SpectrumPoint(
+                    energy_eV=e,
+                    transmitted_intensity=_flush_subnormal(res.transmitted_weight),
+                    absorption_fraction=_flush_subnormal(res.absorbed_weight),
+                    path_length_mm=res.total_path_length_mm,
+                    crystal1_pitch_deg=bragg_angles[i] * RAD_TO_DEG,
+                    crystal2_pitch_deg=bragg_angles[i] * RAD_TO_DEG,
+                    crystal2_x_mm=(config.offset_mm / 2.0) / sin_theta,
+                    crystal2_y_mm=config.offset_mm,
+                )
+            except Exception:
+                local_error = True
+                pt = SpectrumPoint(energy_eV=e, transmitted_intensity=0.0, absorption_fraction=1.0)
             local_spectrum.append(pt)
+
+        try:
+            global_error = self._comm.allreduce(1 if local_error else 0, op=lambda a, b: a | b)
+        except Exception:
+            global_error = 0
 
         gathered = self._comm.gather(local_spectrum, root=0)
 
         if self._rank == 0:
             global_spectrum = []
-            for rank_spectrum in gathered:
-                global_spectrum.extend(rank_spectrum)
-            global_spectrum.sort(key=lambda p: p.energy_eV)
+            if gathered:
+                for rank_spectrum in gathered:
+                    global_spectrum.extend(rank_spectrum)
+                global_spectrum.sort(key=lambda p: p.energy_eV)
         else:
             global_spectrum = []
 
@@ -690,6 +852,7 @@ class BeamlineConfig:
     miller_k: int = 1
     miller_l: int = 1
     lattice_constant_A: float = 5.431020511
+    heartbeat_timeout_sec: float = 300.0
 
 
 class BeamlineSimulator:

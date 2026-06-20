@@ -3,6 +3,8 @@
 #include <vector>
 #include <random>
 #include <cstddef>
+#include <atomic>
+#include "fp_control.h"
 
 namespace synchrotron {
 
@@ -66,12 +68,12 @@ public:
         int num_photons_per_point);
 
 private:
-    std::mt19937_64 rng_;
-    std::uniform_real_distribution<double> uniform_dist_;
+    uint64_t base_seed_;
 
     double compute_crystal_absorption(double energy_eV, double path_length_mm) const;
-    double sample_angular_deviation(double darwin_width_rad);
-    bool reflect_from_crystal(double deviation, double darwin_width_rad);
+    double sample_angular_deviation(std::mt19937_64& rng, double darwin_width_rad);
+    bool reflect_from_crystal(std::mt19937_64& rng, double deviation, double darwin_width_rad);
+    double flush_weight(double weight) const;
 };
 
 }

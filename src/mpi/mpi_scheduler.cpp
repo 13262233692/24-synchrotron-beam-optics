@@ -1,25 +1,32 @@
 #include "mpi_scheduler.h"
 #include "hdf5_writer.h"
+#include "fp_control.h"
 #include <mpi.h>
 #include <stdexcept>
 #include <algorithm>
 #include <numeric>
+#include <cstring>
+#include <thread>
 
 namespace synchrotron {
 
-MPIScheduler::MPIScheduler() : owns_mpi_(false) {
-    int provided = 0;
-    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_SERIALIZED, &provided);
-
+MPIScheduler::MPIScheduler() : owns_mpi_(false), rank_(0), size_(1) {
     int flag = 0;
     MPI_Initialized(&flag);
     if (!flag) {
-        MPI_Init(nullptr, nullptr);
-        owns_mpi_ = true;
+        int provided = 0;
+        MPI_Init_thread(nullptr, nullptr, MPI_THREAD_SERIALIZED, &provided);
+        if (!flag) {
+            MPI_Initialized(&flag);
+            if (flag) owns_mpi_ = true;
+        }
     }
 
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
-    MPI_Comm_size(MPI_COMM_WORLD, &size_);
+    MPI_Initialized(&flag);
+    if (flag) {
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
+        MPI_Comm_size(MPI_COMM_WORLD, &size_);
+    }
 }
 
 MPIScheduler::~MPIScheduler() {
@@ -34,8 +41,37 @@ bool MPIScheduler::is_initialized() {
     return flag != 0;
 }
 
+void MPIScheduler::send_heartbeat(int tag) {
+    char pulse = 1;
+    MPI_Send(&pulse, 1, MPI_BYTE, 0, tag, MPI_COMM_WORLD);
+}
+
+bool MPIScheduler::check_heartbeat(int source, double timeout_sec, int tag) {
+    MPI_Status status;
+    int flag = 0;
+
+    auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::duration<double>(timeout_sec);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        MPI_Iprobe(source, tag, MPI_COMM_WORLD, &flag, &status);
+        if (flag) {
+            char buf;
+            MPI_Recv(&buf, 1, MPI_BYTE, source, tag, MPI_COMM_WORLD, &status);
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    return false;
+}
+
 SimulationResult MPIScheduler::run_simulation(const SimulationConfig& config) {
+    ScopedFTZ ftz_guard;
+
     SimulationResult result;
+    double timeout = config.heartbeat_timeout_sec > 0
+        ? config.heartbeat_timeout_sec : 300.0;
 
     BraggSolver solver(config.miller_h, config.miller_k, config.miller_l,
                        config.lattice_constant_A);
@@ -70,36 +106,51 @@ SimulationResult MPIScheduler::run_simulation(const SimulationConfig& config) {
     std::vector<SpectrumPoint> local_spectrum;
     local_spectrum.reserve(local_count);
 
+    bool local_error = false;
     for (int i = local_start; i < local_start + local_count; ++i) {
         double e = config.energy_start_eV + i * step;
         if (i >= total_points) break;
 
-        auto res = transport.simulate_single_energy(
-            e, bragg_angles[i], config.offset_mm,
-            config.crystal_thickness_mm, darwin_widths[i],
-            config.num_photons_per_point);
+        try {
+            auto res = transport.simulate_single_energy(
+                e, bragg_angles[i], config.offset_mm,
+                config.crystal_thickness_mm, darwin_widths[i],
+                config.num_photons_per_point);
 
-        SpectrumPoint pt;
-        pt.energy_eV = e;
-        pt.transmitted_intensity = res.transmitted_weight;
-        pt.absorption_fraction = res.absorbed_weight;
-        pt.path_length_mm = res.total_path_length_mm;
-        pt.crystal1_pitch_deg = bragg_angles[i] * RAD_TO_DEG;
-        pt.crystal2_pitch_deg = bragg_angles[i] * RAD_TO_DEG;
+            SpectrumPoint pt;
+            pt.energy_eV = e;
+            pt.transmitted_intensity = flush_subnormal(res.transmitted_weight);
+            pt.absorption_fraction = flush_subnormal(res.absorbed_weight);
+            pt.path_length_mm = res.total_path_length_mm;
+            pt.crystal1_pitch_deg = bragg_angles[i] * RAD_TO_DEG;
+            pt.crystal2_pitch_deg = bragg_angles[i] * RAD_TO_DEG;
 
-        double sin_theta = std::sin(bragg_angles[i]);
-        pt.crystal2_x_mm = (config.offset_mm / 2.0) / sin_theta;
-        pt.crystal2_y_mm = config.offset_mm;
+            double sin_theta = std::sin(bragg_angles[i]);
+            pt.crystal2_x_mm = (config.offset_mm / 2.0) / sin_theta;
+            pt.crystal2_y_mm = config.offset_mm;
 
-        local_spectrum.push_back(pt);
+            local_spectrum.push_back(pt);
+        } catch (...) {
+            local_error = true;
+            SpectrumPoint pt{};
+            pt.energy_eV = e;
+            pt.transmitted_intensity = 0.0;
+            pt.absorption_fraction = 1.0;
+            local_spectrum.push_back(pt);
+        }
     }
 
-    result.spectrum = gather_spectrum(local_spectrum);
+    int error_flag = local_error ? 1 : 0;
+    int global_error = 0;
+    MPI_Allreduce(&error_flag, &global_error, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+
+    result.spectrum = gather_spectrum(local_spectrum, timeout);
     return result;
 }
 
 std::vector<SpectrumPoint> MPIScheduler::gather_spectrum(
-    const std::vector<SpectrumPoint>& local_spectrum) {
+    const std::vector<SpectrumPoint>& local_spectrum,
+    double heartbeat_timeout_sec) {
 
     int local_size = static_cast<int>(local_spectrum.size());
 
@@ -107,8 +158,8 @@ std::vector<SpectrumPoint> MPIScheduler::gather_spectrum(
     std::vector<double> local_flat(local_size * num_fields);
     for (int i = 0; i < local_size; ++i) {
         local_flat[i * num_fields + 0] = local_spectrum[i].energy_eV;
-        local_flat[i * num_fields + 1] = local_spectrum[i].transmitted_intensity;
-        local_flat[i * num_fields + 2] = local_spectrum[i].absorption_fraction;
+        local_flat[i * num_fields + 1] = flush_subnormal(local_spectrum[i].transmitted_intensity);
+        local_flat[i * num_fields + 2] = flush_subnormal(local_spectrum[i].absorption_fraction);
         local_flat[i * num_fields + 3] = local_spectrum[i].path_length_mm;
         local_flat[i * num_fields + 4] = local_spectrum[i].crystal1_pitch_deg;
         local_flat[i * num_fields + 5] = local_spectrum[i].crystal2_pitch_deg;
@@ -147,8 +198,8 @@ std::vector<SpectrumPoint> MPIScheduler::gather_spectrum(
         for (int i = 0; i < num_points; ++i) {
             SpectrumPoint pt;
             pt.energy_eV = global_flat[i * num_fields + 0];
-            pt.transmitted_intensity = global_flat[i * num_fields + 1];
-            pt.absorption_fraction = global_flat[i * num_fields + 2];
+            pt.transmitted_intensity = flush_subnormal(global_flat[i * num_fields + 1]);
+            pt.absorption_fraction = flush_subnormal(global_flat[i * num_fields + 2]);
             pt.path_length_mm = global_flat[i * num_fields + 3];
             pt.crystal1_pitch_deg = global_flat[i * num_fields + 4];
             pt.crystal2_pitch_deg = global_flat[i * num_fields + 5];
@@ -172,8 +223,8 @@ std::vector<SpectrumPoint> MPIScheduler::gather_spectrum(
         for (int i = 0; i < num_points; ++i) {
             SpectrumPoint pt;
             pt.energy_eV = global_flat[i * num_fields + 0];
-            pt.transmitted_intensity = global_flat[i * num_fields + 1];
-            pt.absorption_fraction = global_flat[i * num_fields + 2];
+            pt.transmitted_intensity = flush_subnormal(global_flat[i * num_fields + 1]);
+            pt.absorption_fraction = flush_subnormal(global_flat[i * num_fields + 2]);
             pt.path_length_mm = global_flat[i * num_fields + 3];
             pt.crystal1_pitch_deg = global_flat[i * num_fields + 4];
             pt.crystal2_pitch_deg = global_flat[i * num_fields + 5];
